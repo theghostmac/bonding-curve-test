@@ -1,17 +1,36 @@
-## Foundry
+# Bonding Curve Test
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+## Review
+Analyzing the original BondingCurve, I could say that It is minimal and gas-efficient.
+It can handle larger numbers, although at the risk of overflows for them.
+Exponential operations `expWad` can easily overflow with large numbers, and
+the contract didn't protect against this.
 
-Foundry consists of:
+More stuff:
+- High: No bounds on exponential calculations
+- Medium: No transaction size limits
+- Medium: No supply caps
+- Low: No event emissions for important state changes
 
--   **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
--   **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
--   **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
--   **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+```solidity
+// Original - more flexible but dangerous
+function getAmountOut(uint256 x0, uint256 deltaY) public view returns (uint256 deltaX)
 
-## Documentation
+// This version - safer but more constrained
+if (remainingSupply < MIN_REMAINING_SUPPLY) {
+    revert InsufficientRemainingSupply(remainingSupply, MIN_REMAINING_SUPPLY);
+}
+```
 
-https://book.getfoundry.sh/
+The original version could be vulnerable to:
+- integer overflow attacks
+- economic attacks through large transactions
+- potential DOS through numerical limitations
+
+Upon trying to solve this, I figured it comes at great costs like:
+- max supply must be lowered
+- transaction sizes must also be low/restricted
+- there's now more gas costs due to the checks being done
 
 ## Usage
 
@@ -24,7 +43,7 @@ $ forge build
 ### Test
 
 ```shell
-$ forge test
+$ forge test -vvv
 ```
 
 ### Format

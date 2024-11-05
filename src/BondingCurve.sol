@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.13;
 
-import { FixedPointMathLib } from "@solady/src/utils/FixedPointMathLib.sol";
+import "solady/utils/FixedPointMathLib.sol";
 
 /*
  * @title BondingCurve
@@ -11,7 +11,7 @@ import { FixedPointMathLib } from "@solady/src/utils/FixedPointMathLib.sol";
  * - A is the initial price factor
  * - B is the exponential growth factor
  * - x is the current supply.
-*/
+ */
 contract BondingCurve {
     using FixedPointMathLib for uint256;
     using FixedPointMathLib for int256;
@@ -23,63 +23,60 @@ contract BondingCurve {
     uint256 public immutable B;
 
     /// @notice Maximum allowed supply to prevent numerical overflow.
-    uint public constant MAX_SUPPLY = 1_000_000_000e18; //  1 billion tokens.
+    uint256 public constant MAX_SUPPLY = 10_000_000e18; // 10M tokens
 
     /// @notice Maximum transaction size to prevent price manipulation.
-    uint256 public constant MAX_TX_SIZE = 10_000_000e18; // 10 million tokens.
+    uint256 public constant MAX_TX_SIZE = 1_000_000e18; // 1M tokens
 
-    /// @dev Minimum price factor to ensure non-zero pricing.
-    uint256 private constant MIN_A = 1e6; // 0.000001 USDC per token minimum start price.
+    /// @dev Maximum exponent allowed to prevent overflow
+    int256 public constant MAX_EXP_VALUE = 50e18; // Maximum safe value for expWad
 
-    /// @dev Maximum price factor to prevent excessive pricing.
-    uint256 private constant MAX_A = 1e12; // 1 USDC per token maximum start price.
-
-    /// @dev Minimum growth factor to ensure price growth.
-    uint256 private constant MIN_B = 1e12; // 0.000001 exponential growth minimum.
-
-    /// @dev Maximum growth factor to prevent excessive growth
-    uint256 private constant MAX_B = 1e15; // 0.001 exponential growth maximum
+    /// @dev Minimum remaining supply before all purchases are rejected
+    uint256 public constant MIN_REMAINING_SUPPLY = 1000e18;
 
     /*
      * @notice Thrown when supply would exceed maximum
      * @param supply The requested supply amount
      * @param maximum The maximum allowed supply
-    */
+     */
     error SupplyExceedsMaximum(uint256 supply, uint256 maximum);
 
     /*
      * @notice Thrown when transaction size exceeds maximum
      * @param size1 The requested transaction size
      * @param maximum The maximum allowed size
-    */
+     */
     error TransactionTooLarge(uint256 size, uint256 maximum);
 
-    /*
-     * @notice Thrown when parameter is outside allowed range
-     * @param value The provided value
-     * @param minimum The minimum allowed value
-     * @param maximum The maximum allowed value
-    */
-    error ParameterOutOfRange(uint256 value, uint256 minimum, uint256 maximum);
+    /// @notice Thrown when an exponent calculation would exceed safe bounds
+    /// @param value The exponent value that exceeded the maximum
+    /// @param maximum The maximum allowed exponent value
+    error ExponentTooLarge(int256 value, int256 maximum);
+
+    /// @notice Thrown when remaining supply is below minimum threshold for purchases
+    /// @param remaining Current remaining supply
+    /// @param minimum Minimum required remaining supply
+    error InsufficientRemainingSupply(uint256 remaining, uint256 minimum);
 
     /*
      * @notice Creating a new bonding curve with specified parameters.
      * @param _a Initial price factor
      * @param _b Exponential growth facto
-    */
+     */
     constructor(uint256 _a, uint256 _b) {
-        // Validate A is within safe range
-        if (_a < MIN_A || _a > MAX_A) {
-            revert ParameterOutOfRange(_a, MIN_A, MAX_A);
-        }
-
-        // Validate B is within safe range
-        if (_b < MIN_B || _b > MAX_B) {
-            revert ParameterOutOfRange(_b, MIN_B, MAX_B);
-        }
-
+        require(_a > 0, "A must be positive");
+        require(_b > 0, "B must be positive");
         A = _a;
         B = _b;
+    }
+
+    /// @notice Validates that an exponent value is within safe calculation bounds
+    /// @param value The exponent value to check
+    /// @dev Reverts with ExponentTooLarge if value exceeds MAX_EXP_VALUE
+    function _checkExponent(int256 value) internal pure {
+        if (value > MAX_EXP_VALUE) {
+            revert ExponentTooLarge(value, MAX_EXP_VALUE);
+        }
     }
 
     /*
@@ -89,8 +86,11 @@ contract BondingCurve {
      * @param x0 Current token supply
      * @param deltaX Number of tokens to sell
      * @param deltaY Amount of payment tokens to receive.
-    */
-    function getFundsReceived(uint256 x0, uint256 deltaX) public view returns (uint256 deltaY) {
+     */
+    function getFundsReceived(
+        uint256 x0,
+        uint256 deltaX
+    ) public view returns (uint256 deltaY) {
         // Validate maximum supply
         if (x0 > MAX_SUPPLY) {
             revert SupplyExceedsMaximum(x0, MAX_SUPPLY);
@@ -105,13 +105,17 @@ contract BondingCurve {
         require(x0 >= deltaX, "Cannot sell more than exists");
 
         // Calculate e^(B*x0)
-        int256 exp_b_x0 = (int256(B.mulWad(x0))).expWad();
+        int256 exp_b_x0 = int256(B.mulWad(x0));
 
         // Calculate e^(B*x1) where x1 = x0 - deltaX
-        int256 exp_b_x1 = (int256(B.mulWad(x0 - deltaX))).expWad();
+        int256 exp_b_x1 = int256(B.mulWad(x0 - deltaX));
+
+        // Check exponentiation
+        _checkExponent(exp_b_x0);
+        _checkExponent(exp_b_x1);
 
         // Calculate e^(B*x0) - e^(B*x1)
-        uint256 delta = uint256(exp_b_x0 - exp_b_x1);
+        uint256 delta = uint256(exp_b_x0.expWad() - exp_b_x1.expWad());
 
         // Calculate final amount: (A/B) * delta
         deltaY = A.fullMulDiv(delta, B);
@@ -124,27 +128,40 @@ contract BondingCurve {
      * @param deltaY Amount of payment tokens to spend
      * @return deltaX Number of tokens that can be purchased
      */
-    function getAmountOut(uint256 x0, uint256 deltaY) public view returns (uint256 deltaX) {
-        // Validate maximum supply
-        if (x0 > MAX_SUPPLY) {
+    function getAmountOut(
+        uint256 x0,
+        uint256 deltaY
+    ) public view returns (uint256 deltaX) {
+        // Check remaining supply first
+        uint256 remainingSupply = MAX_SUPPLY - x0;
+        if (remainingSupply < MIN_REMAINING_SUPPLY) {
+            revert InsufficientRemainingSupply(
+                remainingSupply,
+                MIN_REMAINING_SUPPLY
+            );
+        }
+
+        // Base validations
+        if (x0 >= MAX_SUPPLY) {
             revert SupplyExceedsMaximum(x0, MAX_SUPPLY);
         }
 
         // Calculate e^(B*x0)
-        uint256 exp_b_x0 = uint256((int256(B.mulWad(x0))).expWad());
+        int256 exp_b_x0 = int256(B.mulWad(x0));
+        _checkExponent(exp_b_x0);
 
         // Calculate e^(B*x0) + (deltaY*B/A)
-        uint256 exp_b_x1 = exp_b_x0 + deltaY.fullMulDiv(B, A);
+        uint256 exp_b_x1 = uint256(exp_b_x0.expWad()) + deltaY.fullMulDiv(B, A);
 
         // Calculate (ln(exp_b_x1)/B) - x0
         deltaX = uint256(int256(exp_b_x1).lnWad()).divWad(B) - x0;
 
-        // Validate transaction size
+        // Validate size
         if (deltaX > MAX_TX_SIZE) {
             revert TransactionTooLarge(deltaX, MAX_TX_SIZE);
         }
 
-        // Validate final supply doesn't exceed maximum
+        // Final supply check
         if (x0 + deltaX > MAX_SUPPLY) {
             revert SupplyExceedsMaximum(x0 + deltaX, MAX_SUPPLY);
         }
@@ -157,11 +174,16 @@ contract BondingCurve {
      * @return price Current token price
      */
     function getCurrentPrice(uint256 x) public view returns (uint256 price) {
+        if (x > MAX_SUPPLY) {
+            revert SupplyExceedsMaximum(x, MAX_SUPPLY);
+        }
+
         // Calculate e^(B+x)
-        int256 exp_b_x = (int256(B.mulWad(x))).expWad();
+        int256 exp_b_x = int256(B.mulWad(x));
+        _checkExponent(exp_b_x);
 
         // Calculate A * e^(B*x)
-        price = A.mulWad(uint256(exp_b_x));
+        price = A.mulWad(uint256(exp_b_x.expWad()));
     }
 
     /**
@@ -170,7 +192,10 @@ contract BondingCurve {
      * @param deltaX Size of potential purchase
      * @return priceImpact Percentage price increase (in basis points)
      */
-    function simulatePriceImpact(uint256 x0, uint256 deltaX) external view returns (uint256 priceImpact) {
+    function simulatePriceImpact(
+        uint256 x0,
+        uint256 deltaX
+    ) external view returns (uint256 priceImpact) {
         uint256 initialPrice = getCurrentPrice(x0);
         uint256 finalPrice = getCurrentPrice(x0 + deltaX);
 
